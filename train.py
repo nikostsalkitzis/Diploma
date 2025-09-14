@@ -11,7 +11,6 @@ def parse():
     parser = argparse.ArgumentParser()
 
     # LSTM+CNN parameters
-    parser.add_argument('--window_size', type=int, default=48)
     parser.add_argument('--input_features', type=int, default=8)
     parser.add_argument('--hidden_size', type=int, default=64)
     parser.add_argument('--lstm_layers', type=int, default=2)
