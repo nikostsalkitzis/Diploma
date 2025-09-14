@@ -43,7 +43,8 @@ def main():
     print('Using device', device)
 
     # Model
-    model = LSTMCNNClassifier(vars(args))
+    model = LSTMCNNClassifier(**vars(args))
+    
     model.to(device)
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
