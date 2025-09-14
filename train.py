@@ -33,7 +33,7 @@ def parse():
     parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
-    args.seq_len = args.window_size  # optional, for compatibility
+    #args.seq_len = args.window_size  # optional, for compatibility
     return args
 
 def main():
