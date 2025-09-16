@@ -11,6 +11,7 @@ def parse():
     parser = argparse.ArgumentParser()
 
     # LSTM+CNN parameters
+    parser.add_argument('--window_size', type=int, default=48)
     parser.add_argument('--input_features', type=int, default=8)
     parser.add_argument('--hidden_size', type=int, default=64)
     parser.add_argument('--lstm_layers', type=int, default=2)
@@ -33,7 +34,7 @@ def parse():
     parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
-    #args.seq_len = args.window_size  # optional, for compatibility
+    args.seq_len = args.window_size  # optional, for compatibility
     return args
 
 def main():
@@ -42,8 +43,7 @@ def main():
     print('Using device', device)
 
     # Model
-    model = LSTMCNNClassifier(**vars(args))
-    
+    model = LSTMCNNClassifier(vars(args))
     model.to(device)
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
