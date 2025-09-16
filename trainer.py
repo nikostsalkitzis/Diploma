@@ -1,14 +1,13 @@
-import os
-import numpy as np
 import torch
+import numpy as np
+from tqdm import tqdm
 import torch.nn as nn
 import sklearn.metrics
 from sklearn.covariance import EllipticEnvelope
-from tqdm import tqdm
-
+import os
 
 class Trainer:
-    """Class to train the classifier."""
+    """Class to train the classifier"""
 
     def __init__(self, model, optim, sched, loaders, args):
         self.model = model
@@ -17,153 +16,125 @@ class Trainer:
         self.dataloaders = loaders
         self.args = args
         self.criterion = nn.CrossEntropyLoss()
-        self.current_best_score = 0.0
+        self.current_best_score = 0
 
     def train(self):
         for epoch in range(self.args.epochs):
-            epoch_metrics = {"loss": [], "acc": []}
+            epoch_metrics = {}
 
-            # -------------------- TRAINING -------------------- #
+            # -------- Training -------- #
             self.model.train()
             torch.set_grad_enabled(True)
 
-            for batch in tqdm(self.dataloaders["train"], desc=f"Train {epoch}/{self.args.epochs-1}"):
+            for batch in tqdm(self.dataloaders['train'], desc=f'Train, {epoch}/{self.args.epochs}'):
                 if batch is None:
                     continue
 
-                x = batch["data"].to(self.args.device)       # [batch, seq_len, features]
-                y = batch["user_id"].to(self.args.device)    # [batch]
+                x = batch['data'].to(self.args.device)        # shape: [batch, seq_len, features]
+                user_ids = batch['user_id'].to(self.args.device)
 
-                logits, features = self.model(x)
+                # Forward pass
+                logits, features = self.model(x)  # features = pooled output from LSTM+CNN
 
-                # Loss + backprop
-                loss = self.criterion(logits, y)
+                # Compute accuracy
+                output_probabilities = torch.softmax(logits, dim=1)
+                predicted_class = torch.argmax(output_probabilities, dim=1)
+                acc = (predicted_class == user_ids).float().mean()
+
+                # Compute loss and backprop
+                loss = self.criterion(logits, user_ids)
                 self.optim.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
                 self.optim.step()
 
-                # Accuracy
-                preds = torch.argmax(logits, dim=1)
-                acc = (preds == y).float().mean()
+                # Log metrics
+                for k, v in {'loss': loss.item(), 'acc': acc.item()}.items():
+                    epoch_metrics[k] = epoch_metrics[k] + [v] if k in epoch_metrics else [v]
 
-                epoch_metrics["loss"].append(loss.item())
-                epoch_metrics["acc"].append(acc.item())
+            self.sched.step()
 
-            # scheduler after each epoch
-            if self.sched is not None:
-                self.sched.step()
-
-            # -------------------- FEATURE EXTRACTION -------------------- #
+            # -------- Feature Extraction for Elliptic Envelope -------- #
             self.model.eval()
             torch.set_grad_enabled(False)
 
-            print("Extracting features from train distribution...")
-            feats_train, labels_train = [], []
+            print('Getting features from train distribution...')
+            all_features_train = []
+            all_labels_train = []
 
-            for batch in tqdm(self.dataloaders["train_distribution"], desc=f"TrainDist {epoch}"):
+            for batch in tqdm(self.dataloaders['train_distribution'], desc=f'Train Dist, {epoch}/{self.args.epochs}'):
                 if batch is None:
                     continue
+                x = batch['data'].to(self.args.device)
+                user_ids = batch['user_id'].to(self.args.device)
+                _, features = self.model(x)
+                all_features_train.append(features.detach().cpu())
+                all_labels_train.append(user_ids.detach().cpu())
 
-                x = batch["data"].to(self.args.device)
-                y = batch["user_id"].to(self.args.device)
-                _, f = self.model(x)
+            all_features_train = torch.vstack(all_features_train).numpy()
+            all_labels_train = torch.hstack(all_labels_train).numpy()
 
-                feats_train.append(f.detach().cpu())
-                labels_train.append(y.detach().cpu())
-
-            if len(feats_train) == 0:
-                print("⚠️ No features collected from train_distribution. Skipping envelope fit.")
-                continue
-
-            feats_train = torch.vstack(feats_train).numpy()
-            labels_train = torch.hstack(labels_train).numpy()
-
-            # Fit EllipticEnvelope for each patient
-            print("Training robust covariance models...")
+            print('Training Robust Covariance...')
             clfs = []
             for subject in range(self.args.num_patients):
-                subj_feats = feats_train[labels_train == subject]
-                if len(subj_feats) < 2:
-                    # fallback: identity model if not enough samples
-                    clfs.append(None)
-                    continue
-                clf = EllipticEnvelope(support_fraction=1.0)
-                clf.fit(subj_feats)
+                subject_features_train = all_features_train[all_labels_train==subject]
+                clf = EllipticEnvelope(support_fraction=1.0).fit(subject_features_train)
                 clfs.append(clf)
 
-            # -------------------- VALIDATION -------------------- #
-            print("Validation & anomaly scoring...")
-            anomaly_scores, relapse_labels, user_ids = [], [], []
+            # -------- Validation -------- #
+            print('Calculating accuracy on validation set and anomaly scores...')
+            anomaly_scores = []
+            relapse_labels = []
+            user_ids_list = []
 
-            for batch in tqdm(self.dataloaders["val"], desc=f"Val {epoch}"):
+            for batch in tqdm(self.dataloaders['val'], desc=f'Val, {epoch}/{self.args.epochs}'):
                 if batch is None:
                     continue
+                x = batch['data'].to(self.args.device)
+                user_id = batch['user_id'].item()
 
-                x = batch["data"].to(self.args.device)
-                y_user = batch["user_id"].item()
-                relapse = batch["relapse_label"].item()
+                # Forward
+                logits, features = self.model(x)
+                features = features.detach().cpu().numpy()
+                current_clf = clfs[user_id]
 
-                logits, f = self.model(x)
-                f = f.detach().cpu().numpy()
-
-                clf = clfs[y_user]
-                if clf is None:
-                    score = 0.0  # if no model for that user
-                else:
-                    score = -clf.decision_function(f).mean()
-
-                anomaly_scores.append(score)
-                relapse_labels.append(relapse)
-                user_ids.append(y_user)
-
-            if len(anomaly_scores) == 0:
-                print("⚠️ Validation set is empty.")
-                continue
+                anomaly_score = -current_clf.decision_function(features).mean()
+                anomaly_scores.append(anomaly_score)
+                relapse_labels.append(batch['relapse_label'].item())
+                user_ids_list.append(user_id)
 
             anomaly_scores = np.array(anomaly_scores)
             relapse_labels = np.array(relapse_labels)
-            user_ids = np.array(user_ids)
+            user_ids_list = np.array(user_ids_list)
 
-            # -------------------- METRICS -------------------- #
-            aurocs, auprcs = [], []
+            # -------- Metrics -------- #
+            all_auroc, all_auprc = [], []
 
-            for u in range(self.args.num_patients):
-                mask = user_ids == u
-                if mask.sum() == 0:
-                    continue
-                scores_u = anomaly_scores[mask]
-                labels_u = relapse_labels[mask]
+            for user in range(self.args.num_patients):
+                user_anomaly_scores = anomaly_scores[user_ids_list==user]
+                user_relapse_labels = relapse_labels[user_ids_list==user]
 
-                precision, recall, _ = sklearn.metrics.precision_recall_curve(labels_u, scores_u)
-                fpr, tpr, _ = sklearn.metrics.roc_curve(labels_u, scores_u)
+                precision, recall, _ = sklearn.metrics.precision_recall_curve(user_relapse_labels, user_anomaly_scores)
+                fpr, tpr, _ = sklearn.metrics.roc_curve(user_relapse_labels, user_anomaly_scores)
 
                 auroc = sklearn.metrics.auc(fpr, tpr)
                 auprc = sklearn.metrics.auc(recall, precision)
 
-                aurocs.append(auroc)
-                auprcs.append(auprc)
-                print(f"User {u}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}")
+                all_auroc.append(auroc)
+                all_auprc.append(auprc)
+                print(f'USER: {user}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}')
 
-            if len(aurocs) == 0:
-                print("⚠️ No AUROC/AUPRC could be computed.")
-                continue
+            total_auroc = np.mean(all_auroc)
+            total_auprc = np.mean(all_auprc)
+            total_avg = (total_auroc + total_auprc) / 2
 
-            total_auroc = np.mean(aurocs)
-            total_auprc = np.mean(auprcs)
-            total_avg = 0.5 * (total_auroc + total_auprc)
+            print(f'Total AUROC: {total_auroc:.4f}, Total AUPRC: {total_auprc:.4f}, Total AVG: {total_avg:.4f}, '
+                  f'Train Loss: {np.mean(epoch_metrics["loss"]):.4f}, Train Acc: {np.mean(epoch_metrics["acc"]):.4f}')
 
-            print(
-                f"Total AUROC: {total_auroc:.4f} | "
-                f"Total AUPRC: {total_auprc:.4f} | "
-                f"AVG: {total_avg:.4f} | "
-                f"TrainLoss: {np.mean(epoch_metrics['loss']):.4f} | "
-                f"TrainAcc: {np.mean(epoch_metrics['acc']):.4f}"
-            )
-
-            # -------------------- SAVE BEST MODEL -------------------- #
+            # Save best model
             if total_avg > self.current_best_score:
                 self.current_best_score = total_avg
                 os.makedirs(self.args.save_path, exist_ok=True)
-                torch.save(self.model.state_dict(), os.path.join(self.args.save_path, "best_model.pth"))
-                print("✅ Saved new best model.")
+                torch.save(self.model.state_dict(), os.path.join(self.args.save_path, 'best_model.pth'))
+                print('Saved best model!')
+
