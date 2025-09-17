@@ -1,95 +1,72 @@
-import math
-import torch
-import torch.nn as nn 
-from torch import Tensor
-import torch.nn.functional as F
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
-        """
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class LSTMCNNClassifier(nn.Module):
-    """
-    LSTM + CNN based classifier for time series data.
-    """
-
-    def __init__(self, args):
+class CNNLSTMClassifier(nn.Module):
+    def __init__(
+        self,
+        input_features,
+        cnn_channels=128,
+        lstm_hidden=32,
+        lstm_layers=1,
+        window_size=48,
+        num_patients=10,
+        device='cuda'
+    ):
         super().__init__()
-
-        # Default parameters
-        args_defaults = dict(
-            input_features=10,
-            hidden_size=64,
-            lstm_layers=2,
-            cnn_channels=32,
-            kernel_size=3,
-            dropout=0.2,
-            num_patients=10
+        
+        # input parameters
+        self.input_channels = input_features
+        self.num_patients = num_patients
+        self.hidden_size = lstm_hidden
+        self.seq_len = window_size
+        self.lstm_layers = lstm_layers
+        self.device = device
+        
+        # CNN layers (feature extraction)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels=self.input_channels, out_channels=cnn_channels//2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cnn_channels//2),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=cnn_channels//2, out_channels=cnn_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cnn_channels),
+            nn.ReLU()
         )
-
-        for arg, default in args_defaults.items():
-            setattr(self, arg, args[arg] if arg in args and args[arg] is not None else default)
-
-        # LSTM layer
+        
+        # LSTM for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=self.input_features,
+            input_size=cnn_channels,           # matches CNN out_channels
             hidden_size=self.hidden_size,
             num_layers=self.lstm_layers,
-            batch_first=True,
-            bidirectional=True
+            batch_first=True,                   # input shape: (batch, seq_len, features)
+            bidirectional=False
         )
-
-        # 1D CNN layer
-        self.cnn = nn.Conv1d(
-            in_channels=self.hidden_size * 2,  # bidirectional
-            out_channels=self.cnn_channels,
-            kernel_size=self.kernel_size,
-            padding=self.kernel_size // 2
-        )
-
-        # Dropout
-        self.dropout = nn.Dropout(self.dropout)
-
-        # Fully connected classifier
-        self.fc = nn.Linear(self.cnn_channels, self.num_patients)
-
+        
+        # Adaptive pooling and classifier
+        self.adaptive = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Linear(self.hidden_size, self.num_patients)
+        
     def forward(self, x):
         """
-        x: [batch_size, seq_len, input_features]
-        returns: logits [batch_size, num_patients]
+        Args:
+            x: input tensor, shape: (batch_size, channels, seq_len)
+        Returns:
+            logits: classification logits
+            features: LSTM hidden representation (for outlier detection)
         """
+        # CNN expects (batch_size, channels, seq_len)
+        cnn_out = self.cnn(x)  # shape: (batch, cnn_channels, seq_len)
+        
+        # transpose for LSTM: (batch, seq_len, features)
+        lstm_in = cnn_out.permute(0, 2, 1)
+        
         # LSTM
-        lstm_out, _ = self.lstm(x)  # [batch_size, seq_len, hidden_size*2]
-
-        # CNN expects [batch_size, channels, seq_len]
-        cnn_in = lstm_out.permute(0, 2, 1)
-        cnn_out = F.relu(self.cnn(cnn_in))  # [batch_size, cnn_channels, seq_len]
-
-        # Global average pooling over sequence
-        pooled = cnn_out.mean(dim=2)  # [batch_size, cnn_channels]
-
-        pooled = self.dropout(pooled)
-        logits = self.fc(pooled)  # [batch_size, num_patients]
-
-        return logits, pooled
-
+        lstm_out, (h_n, c_n) = self.lstm(lstm_in)
+        
+        # take last hidden state as features
+        features = lstm_out[:, -1, :]  # shape: (batch, hidden_size)
+        
+        # classification
+        logits = self.classifier(features)
+        
+        return logits, features
