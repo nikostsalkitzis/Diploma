@@ -31,7 +31,7 @@ to run test.py do this :
 >     --mode val
 
 For the newDiploma code for the train.py, run this:
-python train.py \
+>     python train.py \
 >    --num_patients 8 \
 >    --window_size 48 \
 >    --save_path track2_rich_lstmcnn \
