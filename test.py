@@ -15,7 +15,7 @@ def parse():
 
     # model parameters
     parser.add_argument('--window_size', type=int, default=48)
-    parser.add_argument('--input_features', type=int, default=8)
+    parser.add_argument('--input_features', type=int, default=8)  # will add 1 for cluster
     parser.add_argument('--cnn_channels', type=int, default=16)
     parser.add_argument('--lstm_hidden', type=int, default=32)
     parser.add_argument('--lstm_layers', type=int, default=1)
@@ -31,6 +31,7 @@ def parse():
     # checkpoint & scaler
     parser.add_argument('--load_path', type=str, default='checkpoints/best_model.pth')
     parser.add_argument('--scaler_path', type=str, default='checkpoints/scaler.pkl')
+    parser.add_argument('--cluster_path', type=str, default='checkpoints/patient_clusters.pkl')
 
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--mode', type=str, choices=['val', 'test'], default='test')
@@ -44,14 +45,20 @@ def main():
     window_size = args.window_size
     print('Using device:', device)
 
+    # Load cluster info
+    with open(args.cluster_path, 'rb') as f:
+        patient_clusters = pickle.load(f)
+    print('Patient clusters:', patient_clusters)
+
     # Features
     columns_to_scale = ['acc_norm', 'heartRate_mean', 'rRInterval_mean', 'rRInterval_rmssd',
                         'rRInterval_sdnn', 'rRInterval_lombscargle_power_high']
     data_columns = columns_to_scale + ['sin_t', 'cos_t']
 
     # Load model
+    input_features = args.input_features + 1  # add cluster feature
     model = CNNLSTMClassifier(
-        input_features=args.input_features,
+        input_features=input_features,
         cnn_channels=args.cnn_channels,
         lstm_hidden=args.lstm_hidden,
         lstm_layers=args.lstm_layers,
@@ -80,7 +87,8 @@ def main():
         features_path=args.features_path,
         dataset_path=args.dataset_path,
         mode='train',
-        window_size=window_size
+        window_size=window_size,
+        patient_clusters=patient_clusters
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -116,8 +124,6 @@ def main():
     # Evaluate per patient
     all_auroc = []
     all_auprc = []
-    random_auroc = []
-    random_auprc = []
 
     for patient in os.listdir(args.features_path):
         patient_dir = os.path.join(args.features_path, patient)
@@ -136,7 +142,7 @@ def main():
                 relapse_df = relapse_df.iloc[:-1]  # drop last row if falsely added
 
                 user_id = int(patient[1:]) - 1
-                anomaly_scores = []
+                cluster_id = patient_clusters[patient]  # cluster feature
 
                 for day_index in relapse_df['day_index'].unique():
                     day_data = df[df['day_index'] == day_index].copy()
@@ -149,11 +155,15 @@ def main():
                         if len(day_data) == window_size:
                             sequence = day_data[data_columns].to_numpy()
                             sequence[:, :-2] = scaler.transform(sequence[:, :-2])
+                            cluster_col = np.full((sequence.shape[0],1), cluster_id)
+                            sequence = np.hstack([sequence, cluster_col])
                             sequences.append(sequence)
                         else:
                             for start_idx in range(0, len(day_data) - window_size, window_size // 3):
                                 sequence = day_data.iloc[start_idx:start_idx + window_size][data_columns].to_numpy()
                                 sequence[:, :-2] = scaler.transform(sequence[:, :-2])
+                                cluster_col = np.full((sequence.shape[0],1), cluster_id)
+                                sequence = np.hstack([sequence, cluster_col])
                                 sequences.append(sequence)
 
                         sequence_tensor = torch.tensor(np.stack(sequences), dtype=torch.float32).permute(0, 2, 1).to(device)
@@ -162,7 +172,6 @@ def main():
 
                         score = -clfs[user_id].decision_function(features).mean()
 
-                    anomaly_scores.append(score)
                     relapse_df.loc[relapse_df['day_index'] == day_index, 'anomaly_score'] = score
                     user_anomaly_scores.append(score)
                     user_relapse_labels.append(relapse_label)
@@ -187,17 +196,15 @@ def main():
 
             all_auroc.append(auroc)
             all_auprc.append(auprc)
-            random_auroc.append(0.5)
-            random_auprc.append(user_relapse_labels.mean())
 
-            print(f'USER: {patient}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}, Random AUPRC: {user_relapse_labels.mean():.4f}')
+            print(f'USER: {patient}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}')
 
     # Total AUROC/AUPRC
     if args.mode != 'test' and len(all_auroc) > 0:
-        total_auroc = sum(all_auroc) / len(all_auroc)
-        total_auprc = sum(all_auprc) / len(all_auprc)
+        total_auroc = np.mean(all_auroc)
+        total_auprc = np.mean(all_auprc)
         total_avg = (total_auroc + total_auprc) / 2
-        print(f'Total AUROC: {total_auroc:.4f}, Total AUPRC: {total_auprc:.4f}, Total AVG: {total_avg:.4f}, Random AUROC: 0.5000, Random AUPRC: {sum(random_auprc)/len(random_auprc):.4f}, Ideal AVG: {(0.5 + sum(random_auprc)/len(random_auprc))/2:.4f}')
+        print(f'Total AUROC: {total_auroc:.4f}, Total AUPRC: {total_auprc:.4f}, Total AVG: {total_avg:.4f}')
 
 
 if __name__ == '__main__':
