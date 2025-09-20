@@ -2,9 +2,9 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
-import sklearn
 from sklearn.covariance import EllipticEnvelope
 import os
+import sklearn
 
 class Trainer:
 
@@ -117,6 +117,9 @@ class Trainer:
             for user in range(self.args.num_patients):
                 user_scores = anomaly_scores[user_ids_list == user]
                 user_labels = relapse_labels[user_ids_list == user]
+
+                if len(user_scores) == 0 or len(user_labels) == 0:
+                    continue
 
                 precision, recall, _ = sklearn.metrics.precision_recall_curve(user_labels, user_scores)
                 fpr, tpr, _ = sklearn.metrics.roc_curve(user_labels, user_scores)
