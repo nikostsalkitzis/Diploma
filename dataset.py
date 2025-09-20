@@ -4,9 +4,10 @@ import torch
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
+import pickle
 
 class PatientDataset(Dataset):
-    def __init__(self, features_path, dataset_path, mode='train', scaler=None, window_size=48):
+    def __init__(self, features_path, dataset_path, patient_clusters_path=None, mode='train', scaler=None, window_size=48):
         self.features_path = features_path
         self.dataset_path = dataset_path
         self.mode = mode
@@ -17,15 +18,22 @@ class PatientDataset(Dataset):
             'acc_norm', 'heartRate_mean', 'rRInterval_mean', 
             'rRInterval_rmssd', 'rRInterval_sdnn', 'rRInterval_lombscargle_power_high'
         ]
-        self.data_columns = self.columns_to_scale + ['sin_t', 'cos_t']
-
+        self.data_columns = self.columns_to_scale + ['sin_t', 'cos_t', 'cluster_id']  # add cluster_id
+        
         self.data = []
 
+        # load patient clusters
+        self.patient_clusters = None
+        if patient_clusters_path is not None and os.path.exists(patient_clusters_path):
+            self.patient_clusters = pd.read_csv(patient_clusters_path, index_col=0)['cluster_id'].to_dict()
+        
         all_data = pd.DataFrame()
 
         # iterate patients
         for patient in sorted(os.listdir(features_path)):
             patient_dir = os.path.join(features_path, patient)
+            cluster_id = self.patient_clusters.get(patient, 0) if self.patient_clusters else 0
+
             for subfolder in os.listdir(patient_dir):
                 if (mode == 'train' and 'train' in subfolder) or (mode == 'val' and 'val' in subfolder) or (mode == 'test' and 'test' in subfolder):
                     subfolder_dir = os.path.join(patient_dir, subfolder)
@@ -34,6 +42,9 @@ class PatientDataset(Dataset):
                             file_path = os.path.join(subfolder_dir, file)
                             df = pd.read_csv(file_path, index_col=0)
                             df = df.replace([np.inf, -np.inf], np.nan).dropna()
+                            
+                            # append cluster id as column
+                            df['cluster_id'] = cluster_id
                             all_data = pd.concat([all_data, df])
                             
                             # load relapse labels
@@ -70,7 +81,7 @@ class PatientDataset(Dataset):
         # train mode: scale, convert to tensor, channels-first for CNN
         if self.mode == 'train':
             sequence = day_data.copy()
-            sequence[:, :-2] = self.scaler.transform(sequence[:, :-2])  # scale only non-time columns
+            sequence[:, :-1] = self.scaler.transform(sequence[:, :-1])  # scale only non-cluster columns
             sequence_tensor = torch.tensor(sequence, dtype=torch.float32).permute(1, 0)  # (channels, seq_len)
         else:
             # validation/test: handle multiple overlapping sequences per day
@@ -85,7 +96,7 @@ class PatientDataset(Dataset):
                     seq = day_data[start_idx:start_idx+self.window_size]
                     sequences.append(seq)
             sequences = np.stack(sequences)
-            sequences[:, :, :-2] = self.scaler.transform(sequences[:, :, :-2].reshape(-1, len(self.columns_to_scale))).reshape(sequences.shape[0], sequences.shape[1], len(self.columns_to_scale))
+            sequences[:, :, :-1] = self.scaler.transform(sequences[:, :, :-1].reshape(-1, len(self.columns_to_scale))).reshape(sequences.shape[0], sequences.shape[1], len(self.columns_to_scale))
             sequence_tensor = torch.tensor(sequences, dtype=torch.float32).permute(0, 2, 1)  # (num_seq, channels, seq_len)
 
         return {
