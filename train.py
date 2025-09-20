@@ -8,12 +8,11 @@ import pickle
 import os
 
 def parse():
-    '''Returns args passed to the train.py script.'''
     parser = argparse.ArgumentParser()
 
     # LSTM+CNN parameters
     parser.add_argument('--window_size', type=int, default=48)
-    parser.add_argument('--input_features', type=int, default=8)
+    parser.add_argument('--input_features', type=int, default=8)  # will add 1 for cluster
     parser.add_argument('--cnn_channels', type=int, default=128)
     parser.add_argument('--lstm_hidden', type=int, default=32)
     parser.add_argument('--lstm_layers', type=int, default=1)
@@ -22,8 +21,8 @@ def parse():
     parser.add_argument('--num_patients', type=int, default=8)
 
     # input paths
-    parser.add_argument('--features_path', type=str, required=True, help='features path')
-    parser.add_argument('--dataset_path', type=str, required=True, help='dataset path for relapse labels')
+    parser.add_argument('--features_path', type=str, required=True)
+    parser.add_argument('--dataset_path', type=str, required=True)
 
     # learning params    
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam'], default='Adam')
@@ -35,20 +34,40 @@ def parse():
     # checkpoint
     parser.add_argument('--save_path', type=str, default='checkpoints')
 
+    # clustering
+    parser.add_argument('--n_clusters', type=int, default=3)
+
     # device
     parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
     return args
 
+
 def main():
     args = parse()
     device = args.device
     print('Using device:', device)
 
-    # Model
+    # --- Extract or load cluster info --- #
+    cluster_path = os.path.join(args.save_path, 'patient_clusters.pkl')
+    if os.path.exists(cluster_path):
+        with open(cluster_path, 'rb') as f:
+            patient_clusters = pickle.load(f)
+    else:
+        # Compute clusters from extract_features.py logic
+        from extract_features import compute_patient_clusters
+        patient_clusters = compute_patient_clusters(args.dataset_path, n_clusters=args.n_clusters)
+        os.makedirs(args.save_path, exist_ok=True)
+        with open(cluster_path, 'wb') as f:
+            pickle.dump(patient_clusters, f)
+    print('Patient clusters:', patient_clusters)
+
+    # --- Model --- #
+    # Add 1 feature for cluster ID
+    input_features = args.input_features + 1
     model = CNNLSTMClassifier(
-        input_features=args.input_features,
+        input_features=input_features,
         cnn_channels=args.cnn_channels,
         lstm_hidden=args.lstm_hidden,
         lstm_layers=args.lstm_layers,
@@ -61,7 +80,7 @@ def main():
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Number of parameters:', n_parameters)
 
-    # Optimizer
+    # --- Optimizer --- #
     if args.optimizer == 'SGD':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
     elif args.optimizer == 'Adam':
@@ -69,12 +88,13 @@ def main():
 
     scheduler = MultiStepLR(optimizer, milestones=[args.epochs//2, args.epochs//4*3], gamma=0.1)
 
-    # Dataset
+    # --- Dataset --- #
     train_dataset = PatientDataset(
         features_path=args.features_path,
         dataset_path=args.dataset_path,
         mode='train',
-        window_size=args.window_size
+        window_size=args.window_size,
+        patient_clusters=patient_clusters
     )
 
     # Save scaler
@@ -87,13 +107,14 @@ def main():
         dataset_path=args.dataset_path,
         mode='val',
         scaler=train_dataset.scaler,
-        window_size=args.window_size
+        window_size=args.window_size,
+        patient_clusters=patient_clusters
     )
 
     print('Length of train dataset:', len(train_dataset))
     print('Length of valid dataset:', len(valid_dataset))
 
-    # Collate function to ignore None
+    # --- Collate function to ignore None --- #
     def collate_fn(batch):
         batch = [x for x in batch if x is not None]
         if len(batch) == 0:
@@ -112,7 +133,7 @@ def main():
         )
     }
 
-    # Trainer
+    # --- Trainer --- #
     trainer = Trainer(
         model=model,
         optim=optimizer,
