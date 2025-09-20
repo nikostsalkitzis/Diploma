@@ -30,6 +30,7 @@ to run test.py do this :
 >     --device cuda \
 >     --mode val
 For the newDiploma code for the train.py, run this:
+<pre> ```
 >     python train.py \
 >    --num_patients 8 \
 >    --window_size 48 \
@@ -46,7 +47,7 @@ For the newDiploma code for the train.py, run this:
 >    --batch_size 16 \
 >    --epochs 10 \
 >    --device cuda
-
+```</pre>
 
 and for the test.py:
 python test.py \
