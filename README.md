@@ -29,7 +29,6 @@ to run test.py do this :
 >     --lstm_layers 4 \
 >     --device cuda \
 >     --mode val
-
 For the newDiploma code for the train.py, run this:
 >     python train.py \
 >    --num_patients 8 \
