@@ -8,7 +8,7 @@ class CNNLSTMClassifier(nn.Module):
         input_features,
         cnn_channels=128,
         lstm_hidden=32,
-        lstm_layers=1,
+        lstm_layers=4,
         window_size=48,
         num_patients=10,
         device='cuda'
@@ -16,7 +16,7 @@ class CNNLSTMClassifier(nn.Module):
         super().__init__()
         
         # input parameters
-        self.input_channels = input_features
+        self.input_channels = input_features  # now includes cluster_id as channel
         self.num_patients = num_patients
         self.hidden_size = lstm_hidden
         self.seq_len = window_size
