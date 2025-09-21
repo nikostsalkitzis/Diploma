@@ -8,7 +8,7 @@ class CNNLSTMClassifier(nn.Module):
         input_features,
         cnn_channels=128,
         lstm_hidden=32,
-        lstm_layers=1,
+        lstm_layers=4,
         window_size=48,
         num_patients=10,
         device='cuda'
