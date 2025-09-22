@@ -5,7 +5,7 @@ to run the train.py do this :
 >     --num_patients 8 \
 >     --window_size 48 \
 >     --save_path track2_lstmcnn \
->     --features_path data/track2_features/ \
+>     --features_path data/track2_features_new/ \
 >     --dataset_path data/track2/ \
 >     --input_features 8 \
 >     --cnn_channels 128 \
@@ -18,7 +18,7 @@ to run test.py do this :
 >      python test.py \
 >     --num_patients 8 \
 >     --window_size 48 \
->     --features_path data/track2_features/ \
+>     --features_path data/track2_features_new/ \
 >     --dataset_path data/track2/ \
 >     --submission_path submissions_lstmcnn \
 >     --load_path track2_lstmcnn/best_model.pth \
