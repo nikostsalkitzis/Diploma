@@ -9,8 +9,8 @@ to run the train.py do this :
 >     --dataset_path data/track2/ \
 >     --input_features 14 \
 >     --cnn_channels 128 \
->     --lstm_hidden 32 \
->     --lstm_layers 4 \
+>     --lstm_hidden 64 \
+>     --lstm_layers 8 \
 >     --batch_size 16 \
 >     --epochs 10 \
 >     --device cuda
