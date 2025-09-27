@@ -8,7 +8,7 @@ to run the train.py do this :
 >     --features_path data/track2_features/ \
 >     --dataset_path data/track2/ \
 >     --input_features 8 \
->     --cnn_channels 256 \
+>     --cnn_channels 128 \
 >     --lstm_hidden 64 \
 >     --lstm_layers 4 \
 >     --batch_size 16 \
@@ -24,7 +24,7 @@ to run test.py do this :
 >     --load_path track2_lstmcnn/best_model.pth \
 >     --scaler_path track2_lstmcnn/scaler.pkl \
 >     --input_features 8 \
->     --cnn_channels 256 \
+>     --cnn_channels 128 \
 >     --lstm_hidden 64 \
 >     --lstm_layers 4 \
 >     --device cuda \
