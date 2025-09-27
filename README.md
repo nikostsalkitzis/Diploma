@@ -7,7 +7,7 @@ to run the train.py do this :
 >     --save_path track2_lstmcnn \
 >     --features_path data/track2_features/ \
 >     --dataset_path data/track2/ \
->     --input_features 8 \
+>     --input_features 10 \
 >     --cnn_channels 128 \
 >     --lstm_hidden 32 \
 >     --lstm_layers 4 \
@@ -23,7 +23,7 @@ to run test.py do this :
 >     --submission_path submissions_lstmcnn \
 >     --load_path track2_lstmcnn/best_model.pth \
 >     --scaler_path track2_lstmcnn/scaler.pkl \
->     --input_features 8 \
+>     --input_features 10 \
 >     --cnn_channels 128 \
 >     --lstm_hidden 32 \
 >     --lstm_layers 4 \
