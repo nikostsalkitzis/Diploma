@@ -1,125 +1,179 @@
 import torch
 import argparse
 from torch.optim.lr_scheduler import MultiStepLR
-from model import CNNLSTMClassifier
+from model import TransformerClassifier
 from dataset import PatientDataset
 from trainer import Trainer
 import pickle
 import os
 
+
+def get_device(device_str="auto") -> str:
+    if device_str == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    else:
+        try:
+            torch.device(device_str)
+            return device_str
+        except Exception as e:
+            print("handling device error:")
+            print(e)
+
+
 def parse():
     '''Returns args passed to the train.py script.'''
     parser = argparse.ArgumentParser()
+    # use --cores 1 for debugging (since multi threads will raise errors)
+    parser.add_argument('--cores', type=int, default=os.cpu_count())
+    parser.add_argument('--ensembles', type=int, default=5)
 
-    # LSTM+CNN parameters
-    parser.add_argument('--window_size', type=int, default=48)
+    # transformer parameters
+    parser.add_argument('--window_size', type=int, default=24)
+    parser.add_argument('--stride', type=int, default=12)
     parser.add_argument('--input_features', type=int, default=8)
-    parser.add_argument('--cnn_channels', type=int, default=128)
-    parser.add_argument('--lstm_hidden', type=int, default=32)
-    parser.add_argument('--lstm_layers', type=int, default=1)
+    parser.add_argument('--output_dim', type=int, default=2)
+    parser.add_argument('--d_model', type=int, default=32)
+    parser.add_argument('--dim_feedforward_encoder', type=int, default=2048)
+    parser.add_argument('--nhead', type=int, default=8)
+    parser.add_argument('--nlayers', type=int, default=2)
 
-    # num_patients
+    # num_patients - 10 for track 1, 9 for track 2
     parser.add_argument('--num_patients', type=int, default=8)
 
     # input paths
-    parser.add_argument('--features_path', type=str, required=True, help='features path')
-    parser.add_argument('--dataset_path', type=str, required=True, help='dataset path for relapse labels')
+    parser.add_argument('--features_path', default="data/track_2_new_features/", type=str, help='features to use')
+    parser.add_argument('--dataset_path', default="data/track_2/", type=str, help='features to use') # to get relapse labels
 
-    # learning params    
-    parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam'], default='Adam')
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=10)
+    # learning params
+    parser.add_argument('--learning_rate', type=float, help='learning rate', default=1e-3)
+    parser.add_argument('--weight_decay', type=float, help='L2 regularization weight', default=5e-4)
+    parser.add_argument('--batch_size', type=int, help='batch size', default=16)
+    parser.add_argument('--epochs', type=int, help='number of training epochs', default=50)
+
+    # Multi-task learning parameters
+    parser.add_argument('--time_loss_weight', type=float, help='Weight for time prediction loss', default=1.0)
+    parser.add_argument('--activity_loss_weight', type=float, help='Weight for activity classification loss', default=0.8)
 
     # checkpoint
-    parser.add_argument('--save_path', type=str, default='checkpoints')
+    parser.add_argument('--save_path', type=str, help='path to save model checkpoints', default='checkpoints_multi_task')
 
-    # device
-    parser.add_argument('--device', type=str, default='cuda')
+    default_device = get_device()
+    parser.add_argument('--device', type=str, help='device to use (cpu, cuda, cuda[number])', default=default_device)
 
     args = parser.parse_args()
+    args.seq_len = args.window_size
+            
     return args
 
 def main():
+
+    # parse arguments
     args = parse()
+
     device = args.device
-    print('Using device:', device)
+    print('Using device', args.device)
+    print(f'Multi-task Learning - Time Loss Weight: {args.time_loss_weight}, Activity Loss Weight: {args.activity_loss_weight}')
 
-    # Model
-    model = CNNLSTMClassifier(
-        input_features=args.input_features,
-        cnn_channels=args.cnn_channels,
-        lstm_hidden=args.lstm_hidden,
-        lstm_layers=args.lstm_layers,
-        window_size=args.window_size,
-        num_patients=args.num_patients,
-        device=device
-    )
-    model.to(device)
+    # Models
+    models = [TransformerClassifier(vars(args)).to(device) for _ in range(args.num_patients)]
 
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('Number of parameters:', n_parameters)
+    n_parameters = sum(p.numel() for p in models[0].parameters() if p.requires_grad)
+    print('Number of encoder parameters:', n_parameters)
 
-    # Optimizer
-    if args.optimizer == 'SGD':
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
-    elif args.optimizer == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9,0.999), weight_decay=args.weight_decay)
+    optimizers = [ 
+        torch.optim.Adam(
+            params=models[i].parameters(), 
+            lr=args.learning_rate, 
+            betas=(0.9, 0.999), 
+            weight_decay=args.weight_decay
+        ) for i in range(args.num_patients)
+    ]
 
-    scheduler = MultiStepLR(optimizer, milestones=[args.epochs//2, args.epochs//4*3], gamma=0.1)
+    schedulers = [
+        MultiStepLR(optimizers[i], milestones=[args.epochs//2, args.epochs//4*3], gamma=0.1) 
+        for i in range(args.num_patients)
+    ]
 
-    # Dataset
-    train_dataset = PatientDataset(
-        features_path=args.features_path,
-        dataset_path=args.dataset_path,
-        mode='train',
-        window_size=args.window_size
-    )
+    train_datasets, train_dist_datasets, valid_datasets = [], [], []
 
-    # Save scaler
-    os.makedirs(args.save_path, exist_ok=True)
-    with open(os.path.join(args.save_path, 'scaler.pkl'), 'wb') as f:
-        pickle.dump(train_dataset.scaler, f)
-
-    valid_dataset = PatientDataset(
-        features_path=args.features_path,
-        dataset_path=args.dataset_path,
-        mode='val',
-        scaler=train_dataset.scaler,
-        window_size=args.window_size
-    )
-
-    print('Length of train dataset:', len(train_dataset))
-    print('Length of valid dataset:', len(valid_dataset))
-
-    # Collate function to ignore None
-    def collate_fn(batch):
-        batch = [x for x in batch if x is not None]
-        if len(batch) == 0:
-            return None
-        return torch.utils.data.dataloader.default_collate(batch)
-
-    loaders = {
-        'train': torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True, collate_fn=collate_fn
-        ),
-        'val': torch.utils.data.DataLoader(
-            valid_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, collate_fn=collate_fn
-        ),
-        'train_distribution': torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True, collate_fn=collate_fn
+    for patient in ["P"+str(i) for i in range(1, args.num_patients+1)]:
+        train_dataset = PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='train', 
+            window_size=args.window_size, 
+            stride=args.stride, 
+            patient=patient
         )
-    }
+        train_datasets.append(train_dataset)
+        
+        # save scaler as pkl
+        patient_individual_path = os.path.join(args.save_path, patient[1:])
+        os.makedirs(patient_individual_path, exist_ok=True)
+        with open(f'{patient_individual_path}/scaler.pkl', 'wb') as f:
+            pickle.dump(train_dataset.scaler, f)
 
-    # Trainer
+        valid_datasets.append(PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='val', 
+            scaler=train_dataset.scaler, 
+            window_size=args.window_size,
+            stride=args.stride, 
+            patient=patient
+        ))
+
+        train_dist_datasets.append(PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='train', 
+            window_size=args.window_size, 
+            stride=args.stride, 
+            patient=patient
+        ))
+
+    all_loaders = []
+    for i in range(args.num_patients):
+        loaders = {
+            'train': torch.utils.data.DataLoader(
+                train_datasets[i], 
+                batch_size=args.batch_size, 
+                shuffle=True, 
+                num_workers=args.cores, 
+                pin_memory=True
+            ),
+            'val': torch.utils.data.DataLoader(
+                valid_datasets[i], 
+                batch_size=1, 
+                shuffle=False, 
+                num_workers=args.cores, 
+                pin_memory=True
+            ),
+            'train_dist': torch.utils.data.DataLoader(
+                train_dist_datasets[i], 
+                batch_size=1, 
+                shuffle=False, 
+                num_workers=args.cores, 
+                pin_memory=True
+            )
+        }
+        all_loaders.append(loaders)
+
+    # Trainer - Pass the loss weights to trainer
     trainer = Trainer(
-        model=model,
-        optim=optimizer,
-        sched=scheduler,
-        loaders=loaders,
-        args=args
+        models,
+        optimizers,
+        schedulers,
+        all_loaders,
+        args
     )
+
+    # Set the loss weights from command line arguments
+    trainer.time_loss_weight = args.time_loss_weight
+    trainer.activity_loss_weight = args.activity_loss_weight
 
     trainer.train()
 
