@@ -1,160 +1,281 @@
+import pickle
 import torch
 import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
 import sklearn.metrics
-from sklearn.covariance import EllipticEnvelope
 import os
+from model import EnsembleLinear
 
+
+# ------------------------------------------------------------
+# Helper: create ensemble MLP head
+# ------------------------------------------------------------
+def create_ensemble_mlp(args):
+    m = nn.Sequential(
+        EnsembleLinear(args.d_model, args.d_model, args.ensembles),
+        nn.ReLU(),
+        EnsembleLinear(args.d_model, args.d_model, args.ensembles),
+        nn.ReLU(),
+        EnsembleLinear(args.d_model, args.output_dim, args.ensembles),
+    )
+    m.to(args.device)
+    return m
+
+
+# ------------------------------------------------------------
+# Trainer class
+# ------------------------------------------------------------
 class Trainer:
+    """Train encoder + ensemble models for each patient."""
 
-    ''' Class to train the CNN-LSTM classifier + anomaly detector '''
-
-    def __init__(self, model, optim, sched, loaders, args):
-        self.model = model
-        self.optim = optim
-        self.sched = sched
+    def __init__(self, models, optims, scheds, loaders, args):
+        self.models = models
+        self.optims = optims
+        self.scheds = scheds
         self.dataloaders = loaders
         self.args = args
-        self.criterion = nn.CrossEntropyLoss()
-        self.current_best_score = 0
+        self.criterion = nn.MSELoss()
 
-    def train(self):
+        self.current_best_avgs = [-np.inf for _ in range(len(self.models))]
+        self.current_best_aurocs = [-np.inf for _ in range(len(self.models))]
+        self.current_best_auprcs = [-np.inf for _ in range(len(self.models))]
 
-        for epoch in range(self.args.epochs):
-            print(f"\nEpoch {epoch+1}/{self.args.epochs}")
+        self.mlps = []
+        self.optimizers = []
+        for i in range(len(self.models)):
+            ensemble_head = create_ensemble_mlp(self.args)
+            self.mlps.append(ensemble_head)
+            ps = ensemble_head.parameters()
+            self.optimizers.append(torch.optim.Adam(ps, lr=1e-3, weight_decay=1e-4))
 
-            # --- Training Phase --- #
-            epoch_metrics = {}
-            self.model.train()
-            torch.set_grad_enabled(True)
+    # ------------------------------------------------------------
+    # Train encoder (CNN+LSTM) on regression
+    # ------------------------------------------------------------
+    def train_encoder_once(self, epoch: int, i: int, epoch_metrics: dict):
+        for batch in tqdm(self.dataloaders[i]['train'], desc=f'Train Encoder ({i+1}/{len(self.models)})'):
+            if batch is None:
+                continue
 
-            for batch in tqdm(self.dataloaders['train'], desc=f"Train {epoch+1}"):
-                if batch is None:
-                    continue
+            x = batch['data'].to(self.args.device)
+            labels = batch['target'].to(self.args.device)
+            labels = torch.squeeze(labels, dim=-1)
 
-                x = batch['data'].to(self.args.device)      # shape: (B, C, T)
-                user_ids = batch['user_id'].to(self.args.device)
+            self.models[i].train()
+            features, mean = self.models[i](x)
+            mse_loss = self.criterion(mean, labels)
 
-                # Forward
-                logits, features = self.model(x)
+            self.optims[i].zero_grad()
+            mse_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.models[i].parameters(), 5)
+            self.optims[i].step()
 
-                # Accuracy
-                predicted_class = torch.argmax(torch.softmax(logits, dim=1), dim=1)
-                acc = (predicted_class == user_ids).float().mean()
+            metrics = {'loss': mse_loss.item()}
+            for k, v in metrics.items():
+                epoch_metrics[k] = epoch_metrics.get(k, []) + [v]
 
-                # Loss + backprop
-                loss = self.criterion(logits, user_ids)
-                self.optim.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
-                self.optim.step()
+        return epoch_metrics
 
-                # Logging
-                for k, v in {"loss": loss.item(), "acc": acc.item()}.items():
-                    epoch_metrics.setdefault(k, []).append(v)
+    # ------------------------------------------------------------
+    # Resample batch for ensemble training
+    # ------------------------------------------------------------
+    def resample_batch(self, indices, dataset):
+        ensemble_size = self.args.ensembles
+        offsets = torch.zeros_like(indices)
+        data_batch, target_batch = [], []
+        for i in range(indices.size()[0]):
+            while (offsets[i] % ensemble_size) == 0:
+                offsets[i] = torch.randint(low=1, high=len(dataset), size=(1,))
+            r_idx = (offsets[i] + indices[i]) % len(dataset)
+            x = dataset[r_idx]['data']
+            t = dataset[r_idx]['target']
+            data_batch.append(x)
+            target_batch.append(t)
+        data = torch.stack(data_batch).to(self.args.device)
+        targets = torch.stack(target_batch).to(self.args.device)
+        return data, targets
 
-            self.sched.step()
+    # ------------------------------------------------------------
+    # Train ensemble MLPs on top of frozen encoder features
+    # ------------------------------------------------------------
+    def train_ensemble(self, i: int):
+        k = self.args.ensembles
+        ensemble_head = self.mlps[i]
+        ensemble_head.train()
+        optim = self.optimizers[i]
+        size = len(self.dataloaders[i]['train'])
 
-            # --- Validation Phase --- #
-            self.model.eval()
-            torch.set_grad_enabled(False)
+        # 🔧 Ensure the encoder (LSTM) is in training mode for backward()
+        self.models[i].train()
 
-            print("Getting features from train distribution...")
-            all_features_train, all_labels_train = [], []
+        for batch in tqdm(self.dataloaders[i]['train'], desc=f'Train Ensemble ({i+1}/{len(self.models)})'):
+            if batch is None:
+                continue
 
-            for batch in tqdm(self.dataloaders["train_distribution"], desc="Train distribution features"):
-                if batch is None:
-                    continue
+            x = batch['data'].to(self.args.device)
+            targets = batch['target'].to(self.args.device)
+            targets = torch.squeeze(targets, dim=-1)
 
-                x = batch["data"].to(self.args.device)
-                user_ids = batch["user_id"].to(self.args.device)
+            features, _ = self.models[i](x)
 
-                _, features = self.model(x)
-                all_features_train.append(features.detach().cpu())
-                all_labels_train.append(user_ids.detach().cpu())
+            batched_features = features[None, :, :].repeat([k, 1, 1])
+            batched_targets = targets[None, :, :].repeat([k, 1, 1])
+            ensemble_mask = batch['idx'] % k
 
-            all_features_train = torch.vstack(all_features_train).numpy()
-            all_labels_train = torch.hstack(all_labels_train).numpy()
+            resampled_x, r_targets = self.resample_batch(batch['idx'], self.dataloaders[i]['train'].dataset)
+            r_targets = torch.squeeze(r_targets, dim=-1)
+            r_features, _ = self.models[i](resampled_x)
 
-            # Train one EllipticEnvelope per patient
-            print("Training EllipticEnvelope for outlier detection...")
-            clfs = []
-            for subject in range(self.args.num_patients):
-                subject_features = all_features_train[all_labels_train == subject]
-                clf = EllipticEnvelope(support_fraction=1.0).fit(subject_features)
-                clfs.append(clf)
+            batched_features[ensemble_mask] = r_features
+            batched_targets[ensemble_mask] = r_targets
 
-            print("Calculating accuracy on validation set and anomaly scores...")
-            anomaly_scores, relapse_labels, user_ids_list = [], [], []
+            mean = ensemble_head(batched_features)
+            mse_loss = torch.sum((mean - batched_targets) ** 2, dim=(0, 2))
+            total_loss = torch.mean(mse_loss)
 
-            for batch in tqdm(self.dataloaders["val"], desc="Validation"):
-                if batch is None:
-                    continue
+            optim.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(ensemble_head.parameters(), 5)
+            optim.step()
 
-                x = batch["data"].to(self.args.device)   # may be (1, N, C, T) or (B, C, T)
-                user_id = batch["user_id"].to(self.args.device)
+    # ------------------------------------------------------------
+    # Evaluate ensemble variance for anomaly scores
+    # ------------------------------------------------------------
+    def evaluate_ensembles(self, epoch: int, i: int, train_dist_anomaly_scores: dict):
+        k = self.args.ensembles
+        anomaly_scores, relapse_labels, user_ids = [], [], []
 
-                if x.dim() == 4:
-                    # flatten to (N, C, T)
-                    x = x.squeeze(0)
+        _mean = np.mean(train_dist_anomaly_scores[i])
+        _max, _min = np.max(train_dist_anomaly_scores[i]), np.min(train_dist_anomaly_scores[i])
 
-                _, features = self.model(x)
+        for batch in self.dataloaders[i]['val']:
+            if batch is None:
+                continue
+            user_id = batch['user_id'].to(self.args.device)
+            if user_id.item() >= self.args.num_patients:
+                continue
 
-                # if multiple sequences per day, average them
-                if features.dim() > 2:   # (N, hidden_size)
-                    features = features.mean(dim=0, keepdim=True)
-                elif features.dim() == 1:   # (hidden_size,)
-                    features = features.unsqueeze(0)
+            x = batch['data'].to(self.args.device)
+            x = x.squeeze(0)
+            ensemble_head = self.mlps[user_id.item()]
+            ensemble_head.eval()
 
-                features_np = features.detach().cpu().numpy()
-                current_clf = clfs[user_id.item()]
+            targets = batch['target'].to(self.args.device)
+            targets = torch.squeeze(targets)
+            if targets.ndim < 2:
+                targets = torch.reshape(targets, (1, -1))
+            targets = targets[None, :, :].repeat([k, 1, 1])
 
-                anomaly_score = -current_clf.decision_function(features_np).mean()
-                anomaly_scores.append(anomaly_score)
-                relapse_labels.append(batch["relapse_label"].item())
-                user_ids_list.append(batch["user_id"].item())
+            features, _ = self.models[i](x)
+            batched_features = features[None, :, :].repeat([k, 1, 1])
 
-            anomaly_scores = np.array(anomaly_scores)
-            relapse_labels = np.array(relapse_labels)
-            user_ids_list = np.array(user_ids_list)
+            preds = ensemble_head(batched_features)
+            average_pred = torch.mean(preds, 0)
 
-            print("Calculating metrics...")
-            all_auroc, all_auprc = [], []
+            var_score = torch.sum((preds - average_pred) ** 2, dim=(2,))
+            mean_var = torch.mean(torch.mean(var_score, 0)).item()
+            anomaly_score = (mean_var - _mean) / (_max - _min)
 
-            for user in range(self.args.num_patients):
-                user_scores = anomaly_scores[user_ids_list == user]
-                user_labels = relapse_labels[user_ids_list == user]
+            anomaly_scores.append(anomaly_score)
+            relapse_labels.append(batch['relapse_label'].item())
+            user_ids.append(batch['user_id'].item())
 
-                if len(np.unique(user_labels)) < 2:
-                    continue
+        anomaly_scores = (np.array(anomaly_scores) > 0.0).astype(np.float64)
+        relapse_labels = np.array(relapse_labels)
+        user_ids = np.array(user_ids)
+        return anomaly_scores, relapse_labels, user_ids
 
-                precision, recall, _ = sklearn.metrics.precision_recall_curve(user_labels, user_scores)
-                fpr, tpr, _ = sklearn.metrics.roc_curve(user_labels, user_scores)
+    # ------------------------------------------------------------
+    # Compute metrics
+    # ------------------------------------------------------------
+    def calculate_metrics(self, user: int, anomaly_scores, relapse_labels, user_ids, epoch_metrics):
+        assert np.unique(user_ids) == user
 
-                auroc = sklearn.metrics.auc(fpr, tpr)
-                auprc = sklearn.metrics.auc(recall, precision)
-                all_auroc.append(auroc)
-                all_auprc.append(auprc)
+        precision, recall, _ = sklearn.metrics.precision_recall_curve(relapse_labels, anomaly_scores)
+        fpr, tpr, _ = sklearn.metrics.roc_curve(relapse_labels, anomaly_scores)
 
-                print(f"USER: {user}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}")
+        auroc = sklearn.metrics.auc(fpr, tpr)
+        auprc = sklearn.metrics.auc(recall, precision)
+        avg = (auroc + auprc) / 2
+        return auroc, auprc
 
-            total_auroc = np.mean(all_auroc) if all_auroc else 0.0
-            total_auprc = np.mean(all_auprc) if all_auprc else 0.0
-            total_avg = (total_auroc + total_auprc) / 2
+    # ------------------------------------------------------------
+    # Compute training anomaly scores for normalization
+    # ------------------------------------------------------------
+    def get_train_dist_anomaly_scores(self, epoch: int, i: int):
+        k = self.args.ensembles
+        anomaly_scores = []
+        for batch in self.dataloaders[i]['train_dist']:
+            if batch is None:
+                continue
+            x = batch['data'].to(self.args.device)
+            ensemble_head = self.mlps[i]
+            features, _ = self.models[i](x)
+            batched_features = features[None, :, :].repeat([k, 1, 1])
+            preds = ensemble_head(batched_features)
+            average_pred = torch.mean(preds, 0)
+            var_score = torch.sum((preds - average_pred) ** 2, dim=(2,))
+            anomaly_score = torch.mean(torch.mean(var_score, 0)).item()
+            anomaly_scores.append(anomaly_score)
+        return anomaly_scores
 
-            print(
-                f"Epoch {epoch+1} Summary: "
-                f"Train Loss={np.mean(epoch_metrics['loss']):.4f}, "
-                f"Train Acc={np.mean(epoch_metrics['acc']):.4f}, "
-                f"Val AUROC={total_auroc:.4f}, "
-                f"Val AUPRC={total_auprc:.4f}, "
-                f"Avg={total_avg:.4f}"
-            )
+    # ------------------------------------------------------------
+    # Validation phase
+    # ------------------------------------------------------------
+    def validate(self, epoch: int, epoch_metrics: dict, train_dist_anomaly_scores: dict):
+        for i in range(len(self.models)):
+            anomaly_scores, relapse_labels, user_ids = self.evaluate_ensembles(epoch, i, train_dist_anomaly_scores)
+            auroc, auprc = self.calculate_metrics(i, anomaly_scores, relapse_labels, user_ids, epoch_metrics)
 
-            # Save best model
-            if total_avg > self.current_best_score:
-                self.current_best_score = total_avg
+            avg = (auroc + auprc) / 2
+            if avg > self.current_best_avgs[i]:
+                self.current_best_avgs[i] = avg
+                self.current_best_aurocs[i] = auroc
+                self.current_best_auprcs[i] = auprc
                 os.makedirs(self.args.save_path, exist_ok=True)
-                torch.save(self.model.state_dict(), os.path.join(self.args.save_path, "best_model.pth"))
-                print("Saved best model!")
+                if not os.path.exists(os.path.join(self.args.save_path, str(i + 1))):
+                    os.mkdir(f'{self.args.save_path}/{i + 1}')
+                torch.save(self.models[i].state_dict(), os.path.join(self.args.save_path, f'{i + 1}/best_encoder.pth'))
+                torch.save(self.mlps[i].state_dict(), os.path.join(self.args.save_path, f'{i + 1}/best_ensembles.pth'))
+                with open(os.path.join(self.args.save_path, f'{i + 1}/train_dist_anomaly_scores.pkl'), 'wb') as f:
+                    pickle.dump(train_dist_anomaly_scores, f)
+
+        for i in range(len(self.models)):
+            print(f"P{str(i + 1)} AUROC: {self.current_best_aurocs[i]:.4f}, "
+                  f"AUPRC: {self.current_best_auprcs[i]:.4f}, "
+                  f"AVG: {self.current_best_avgs[i]:.4f}")
+
+        total_auroc = sum(self.current_best_aurocs) / len(self.models)
+        total_auprc = sum(self.current_best_auprcs) / len(self.models)
+        total_avg = (total_auroc + total_auprc) / 2
+
+        print(f'TOTAL AUROC: {total_auroc:.4f},  AUPRC: {total_auprc:.4f}, Total AVG: {total_avg:.4f}, '
+              f'Train Loss: {np.mean(epoch_metrics["loss"]):.4f}')
+
+    # ------------------------------------------------------------
+    # Full training loop
+    # ------------------------------------------------------------
+    def train(self):
+        for epoch in range(self.args.epochs):
+            print("=" * 55)
+            print(f"Start epoch {epoch + 1}/{self.args.epochs}")
+            epoch_metrics = {}
+            train_dist_anomaly_scores = {}
+
+            for i in range(len(self.models)):
+                # Train encoder
+                self.models[i].train()
+                epoch_metrics = self.train_encoder_once(epoch, i, epoch_metrics)
+                self.scheds[i].step()
+
+                # Train ensemble MLPs (with model in training mode)
+                self.models[i].train()
+                self.train_ensemble(i)
+
+                # Compute reference anomaly scores
+                with torch.no_grad():
+                    self.models[i].eval()
+                    train_dist_anomaly_scores[i] = self.get_train_dist_anomaly_scores(epoch, i)
+
+            with torch.no_grad():
+                self.validate(epoch, epoch_metrics, train_dist_anomaly_scores)
