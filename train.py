@@ -1,126 +1,196 @@
 import torch
 import argparse
 from torch.optim.lr_scheduler import MultiStepLR
-from model import CNNLSTMClassifier
+from model import CNNLSTMClassifier        # <── Updated import
 from dataset import PatientDataset
 from trainer import Trainer
 import pickle
 import os
 
+
+# ------------------------------------------------------------
+# Utility: choose device
+# ------------------------------------------------------------
+def get_device(device_str="auto") -> str:
+    if device_str == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    else:
+        try:
+            torch.device(device_str)
+            return device_str
+        except Exception as e:
+            print("Invalid device; falling back to CPU:", e)
+            return "cpu"
+
+
+# ------------------------------------------------------------
+# Argument parser
+# ------------------------------------------------------------
 def parse():
-    '''Returns args passed to the train.py script.'''
     parser = argparse.ArgumentParser()
 
-    # LSTM+CNN parameters
-    parser.add_argument('--window_size', type=int, default=48)
-    parser.add_argument('--input_features', type=int, default=8)
-    parser.add_argument('--cnn_channels', type=int, default=128)
-    parser.add_argument('--lstm_hidden', type=int, default=32)
-    parser.add_argument('--lstm_layers', type=int, default=1)
+    # System / environment
+    parser.add_argument('--cores', type=int, default=os.cpu_count())
+    parser.add_argument('--ensembles', type=int, default=5)
 
-    # num_patients
+    # Model hyperparameters
+    parser.add_argument('--window_size', type=int, default=24)
+    parser.add_argument('--stride', type=int, default=12)
+    parser.add_argument('--input_features', type=int, default=8)
+    parser.add_argument('--output_dim', type=int, default=2)
+    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--hidden_dim', type=int, default=128)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dropout', type=float, default=0.2)
+
+    # Patients
     parser.add_argument('--num_patients', type=int, default=8)
 
-    # input paths
-    parser.add_argument('--features_path', type=str, required=True, help='features path')
-    parser.add_argument('--dataset_path', type=str, required=True, help='dataset path for relapse labels')
+    # Dataset paths
+    parser.add_argument('--features_path', default="data/track_2_new_features/", type=str,
+                        help='path to preprocessed patient features')
+    parser.add_argument('--dataset_path', default="data/track_2/", type=str,
+                        help='path to relapse labels')
 
-    # learning params    
-    parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam'], default='Adam')
+    # Training parameters
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=50)
 
-    # checkpoint
+    # Checkpoint path
     parser.add_argument('--save_path', type=str, default='checkpoints')
 
-    # device
-    parser.add_argument('--device', type=str, default='cuda')
+    # Device
+    default_device = get_device()
+    parser.add_argument('--device', type=str, default=default_device)
 
     args = parser.parse_args()
+    args.seq_len = args.window_size
     return args
 
+
+# ------------------------------------------------------------
+# Main training script
+# ------------------------------------------------------------
 def main():
+    # Parse args
     args = parse()
     device = args.device
     print('Using device:', device)
 
-    # Model
-    model = CNNLSTMClassifier(
-        input_features=args.input_features,
-        cnn_channels=args.cnn_channels,
-        lstm_hidden=args.lstm_hidden,
-        lstm_layers=args.lstm_layers,
-        window_size=args.window_size,
-        num_patients=args.num_patients,
-        device=device
-    )
-    model.to(device)
+    # -------------------------------
+    # 1️⃣ Create models (one per patient)
+    # -------------------------------
+    models = [CNNLSTMClassifier(vars(args)).to(device) for _ in range(args.num_patients)]
 
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('Number of parameters:', n_parameters)
+    n_parameters = sum(p.numel() for p in models[0].parameters() if p.requires_grad)
+    print('Number of trainable parameters:', n_parameters)
 
-    # Optimizer
-    if args.optimizer == 'SGD':
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
-    elif args.optimizer == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9,0.999), weight_decay=args.weight_decay)
-
-    scheduler = MultiStepLR(optimizer, milestones=[args.epochs//2, args.epochs//4*3], gamma=0.1)
-
-    # Dataset
-    train_dataset = PatientDataset(
-        features_path=args.features_path,
-        dataset_path=args.dataset_path,
-        mode='train',
-        window_size=args.window_size
-    )
-
-    # Save scaler
-    os.makedirs(args.save_path, exist_ok=True)
-    with open(os.path.join(args.save_path, 'scaler.pkl'), 'wb') as f:
-        pickle.dump(train_dataset.scaler, f)
-
-    valid_dataset = PatientDataset(
-        features_path=args.features_path,
-        dataset_path=args.dataset_path,
-        mode='val',
-        scaler=train_dataset.scaler,
-        window_size=args.window_size
-    )
-
-    print('Length of train dataset:', len(train_dataset))
-    print('Length of valid dataset:', len(valid_dataset))
-
-    # Collate function to ignore None
-    def collate_fn(batch):
-        batch = [x for x in batch if x is not None]
-        if len(batch) == 0:
-            return None
-        return torch.utils.data.dataloader.default_collate(batch)
-
-    loaders = {
-        'train': torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True, collate_fn=collate_fn
-        ),
-        'val': torch.utils.data.DataLoader(
-            valid_dataset, batch_size=1, shuffle=False, num_workers=8, pin_memory=True, collate_fn=collate_fn
-        ),
-        'train_distribution': torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True, collate_fn=collate_fn
+    # -------------------------------
+    # 2️⃣ Create optimizers & schedulers
+    # -------------------------------
+    optimizers = [
+        torch.optim.Adam(
+            params=models[i].parameters(),
+            lr=args.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=args.weight_decay
         )
-    }
+        for i in range(args.num_patients)
+    ]
 
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        optim=optimizer,
-        sched=scheduler,
-        loaders=loaders,
-        args=args
-    )
+    schedulers = [
+        MultiStepLR(optimizers[i],
+                    milestones=[args.epochs // 2, args.epochs // 4 * 3],
+                    gamma=0.1)
+        for i in range(args.num_patients)
+    ]
 
+    # -------------------------------
+    # 3️⃣ Create datasets and dataloaders
+    # -------------------------------
+    train_datasets, train_dist_datasets, valid_datasets = [], [], []
+
+    for patient in [f"P{i}" for i in range(1, args.num_patients + 1)]:
+        print(f"Loading patient {patient} ...")
+
+        # Training dataset
+        train_dataset = PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='train',
+            window_size=args.window_size,
+            stride=args.stride,
+            patient=patient
+        )
+        train_datasets.append(train_dataset)
+
+        # Save scaler for reproducibility
+        patient_id = patient[1:]
+        patient_path = os.path.join(args.save_path, patient_id)
+        os.makedirs(patient_path, exist_ok=True)
+        with open(f'{patient_path}/scaler.pkl', 'wb') as f:
+            pickle.dump(train_dataset.scaler, f)
+
+        # Validation dataset (same scaler)
+        valid_dataset = PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='val',
+            scaler=train_dataset.scaler,
+            window_size=args.window_size,
+            stride=args.stride,
+            patient=patient
+        )
+        valid_datasets.append(valid_dataset)
+
+        # Train-distance dataset (used for ensemble uncertainty calibration)
+        train_dist_dataset = PatientDataset(
+            features_path=args.features_path,
+            dataset_path=args.dataset_path,
+            mode='train',
+            window_size=args.window_size,
+            stride=args.stride,
+            patient=patient
+        )
+        train_dist_datasets.append(train_dist_dataset)
+
+    # Dataloaders per patient
+    all_loaders = []
+    for i in range(args.num_patients):
+        loaders = {
+            'train': torch.utils.data.DataLoader(
+                train_datasets[i],
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.cores,
+                pin_memory=True
+            ),
+            'val': torch.utils.data.DataLoader(
+                valid_datasets[i],
+                batch_size=1,
+                shuffle=False,
+                num_workers=args.cores,
+                pin_memory=True
+            ),
+            'train_dist': torch.utils.data.DataLoader(
+                train_dist_datasets[i],
+                batch_size=1,
+                shuffle=False,
+                num_workers=args.cores,
+                pin_memory=True
+            )
+        }
+        all_loaders.append(loaders)
+
+    # -------------------------------
+    # 4️⃣ Initialize trainer and start training
+    # -------------------------------
+    trainer = Trainer(models, optimizers, schedulers, all_loaders, args)
     trainer.train()
 
 
