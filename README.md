@@ -13,7 +13,7 @@ python train.py \
 --lstm_hidden 32 \
 --lstm_layers 4 \
 --batch_size 16 \
---epochs 50 \
+--epochs 10 \
 --device cuda
 ```
 to run test.py do this : 
@@ -31,7 +31,7 @@ python test.py \
 --lstm_hidden 32 \
 --lstm_layers 4 \
 --device cuda \
---mode val
+--mode test
 ```
 For the newDiploma code for the train.py, run this:
 ```
