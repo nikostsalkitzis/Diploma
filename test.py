@@ -44,11 +44,6 @@ def ensure_time_cols(df):
     return df
 
 def map_scaled_to_model(seq_scaled, cols_scaler, cols_model, raw_seq_for_fallback=None):
-    """
-    seq_scaled: (T, len(cols_scaler)) already scaled by scaler fitted on cols_scaler
-    returns (T, len(cols_model)) in the cols_model order.
-    If cols_model has extra columns not in cols_scaler (rare), uses raw fallback (no scaling) for them.
-    """
     idx_map = []
     missing = []
     for c in cols_model:
@@ -61,12 +56,9 @@ def map_scaled_to_model(seq_scaled, cols_scaler, cols_model, raw_seq_for_fallbac
     if missing:
         if raw_seq_for_fallback is None:
             raise ValueError(f"Missing columns {missing} in scaler; no fallback provided.")
-        # append missing in the correct order (no scaling fallback)
-        # place each missing column scaled ~identity (assumes already in reasonable range)
         extra = np.stack([raw_seq_for_fallback[:, raw_seq_for_fallback_cols.index(c)] for c in missing], axis=1)
         out = np.concatenate([out, extra], axis=1) if out is not None else extra
-        # reorder to cols_model
-        reorder = [ (cols_model.index(c), i) for i,c in enumerate([x for x in cols_model if x in cols_scaler] + missing) ]
+        reorder = [(cols_model.index(c), i) for i, c in enumerate([x for x in cols_model if x in cols_scaler] + missing)]
         reorder_sorted = [i for _, i in sorted(reorder)]
         out = out[:, reorder_sorted]
     return out
@@ -91,13 +83,11 @@ def main():
             train_dists.append(None); cols_model_list.append(None); cols_scaler_list.append(None)
             continue
 
-        # infer input dim from checkpoint
         state = torch.load(enc_pth, map_location="cpu")
-        in_feats_ckpt = state["encoder_input_layer.weight"].shape[1]  # 8 or 10
+        in_feats_ckpt = state["encoder_input_layer.weight"].shape[1]
         cols_model = COLS10 if in_feats_ckpt == 10 else COLS8
         cols_model_list.append(cols_model)
 
-        # build model with matching input_features
         local_args = vars(args).copy()
         local_args["input_features"] = in_feats_ckpt
         model = TransformerHeartPredictor(local_args).to(device)
@@ -105,13 +95,11 @@ def main():
         model.eval()
         encoders.append(model)
 
-        # ensemble
         ensemble = create_ensemble_mlp(args)
         ensemble.load_state_dict(torch.load(ens_pth, map_location=device), strict=True)
         ensemble.eval()
         mlps.append(ensemble)
 
-        # scaler
         with open(scaler_pth, "rb") as f:
             scaler = pickle.load(f)
         scalers.append(scaler)
@@ -121,13 +109,12 @@ def main():
         cols_scaler = COLS10 if n_in == 10 else COLS8
         cols_scaler_list.append(cols_scaler)
 
-        # train anomaly dist
         with open(dist_pth, "rb") as f:
             td = pickle.load(f)
             train_dists.append(td[i])
 
     torch.set_grad_enabled(False)
-    all_auroc, all_auprc = [], []  # <-- accumulate per-user metrics
+    all_auroc, all_auprc = [], []
 
     for patient in sorted(os.listdir(args.features_path)):
         if patient == ".DS_Store": continue
@@ -146,10 +133,8 @@ def main():
                 if not os.path.exists(fpath): continue
 
                 df = pd.read_csv(fpath).replace([np.inf,-np.inf], np.nan).dropna()
-                # ensure sin/cos if any path needs them
                 df = ensure_time_cols(df)
 
-                # pick relapse file and day index
                 if args.mode == "test":
                     relapse_df = pd.read_csv(os.path.join(args.dataset_path, patient, sub, "relapses.csv"))
                     relapse_df = relapse_df.iloc[:-1]
@@ -159,14 +144,14 @@ def main():
                     DAY_INDEX = "day"
 
                 global raw_seq_for_fallback_cols
-                raw_seq_for_fallback_cols = COLS10  # superset order for fallback use
+                raw_seq_for_fallback_cols = COLS10
 
                 for day_idx in relapse_df[DAY_INDEX].unique():
                     day_df = df[df[DAY_INDEX] == day_idx]
                     if len(day_df) < args.window_size:
                         relapse_df.loc[relapse_df[DAY_INDEX] == day_idx, "score"] = 0.0
                         user_preds.append(0.0)
-                        if args.mode != "test":
+                        if "relapse" in relapse_df.columns:
                             user_labels.append(relapse_df[relapse_df[DAY_INDEX]==day_idx]["relapse"].to_numpy()[0])
                         continue
 
@@ -174,21 +159,17 @@ def main():
                     step = max(1, args.window_size // 3)
                     starts = [0] if len(day_df) == args.window_size else range(0, len(day_df)-args.window_size, step)
                     for s in starts:
-                        # 1) build window for SCALER feature set
                         seq_scaler = day_df.iloc[s:s+args.window_size][cols_scaler].to_numpy()
-                        seq_scaled = scaler.transform(seq_scaler)  # (T, len(cols_scaler))
-                        # 2) map to MODEL feature set order (may slice or append fallback for missing)
+                        seq_scaled = scaler.transform(seq_scaler)
                         raw_seq = day_df.iloc[s:s+args.window_size][COLS10].to_numpy()
                         seq_model = map_scaled_to_model(seq_scaled, cols_scaler, cols_model, raw_seq_for_fallback=raw_seq)
                         sequences.append(seq_model)
 
-                    sequence = np.stack(sequences)                     # (M, T, model_C)
-                    seq_tensor = torch.tensor(sequence, dtype=torch.float32).permute(0,2,1).to(device)  # (M, C, T)
+                    sequence = np.stack(sequences)
+                    seq_tensor = torch.tensor(sequence, dtype=torch.float32).permute(0,2,1).to(device)
 
-                    # forward encoder
                     features, _ = encoder(seq_tensor)
 
-                    # ensemble variance anomaly
                     k = args.ensembles
                     bf = features[None, :, :].repeat([k,1,1])
                     preds = ensemble(bf)
@@ -199,11 +180,11 @@ def main():
                     mu = float(np.mean(train_dist)); mx = float(np.max(train_dist)); mn = float(np.min(train_dist))
                     denom = (mx - mn) if (mx - mn) != 0 else 1.0
                     a = (mean_var - mu) / denom
-                    a = 1.0 if a > 0 else 0.0  # keep binary as in your current script
+                    a = 1.0 if a > 0 else 0.0
 
                     relapse_df.loc[relapse_df[DAY_INDEX] == day_idx, "score"] = a
                     user_preds.append(a)
-                    if args.mode != "test":
+                    if "relapse" in relapse_df.columns:
                         user_labels.append(relapse_df[relapse_df[DAY_INDEX]==day_idx]["relapse"].to_numpy()[0])
 
                 if args.mode == "test":
@@ -212,21 +193,21 @@ def main():
                     relapse_df.to_csv(os.path.join(save_dir, "submission.csv"), index=False)
                     print(f"Saved submission to: {save_dir}")
 
-        if args.mode != "test" and len(np.unique(user_labels)) > 1:
+        # --- Print metrics for both validation and test ---
+        if len(np.unique(user_labels)) > 1:
             y_true, y_pred = np.array(user_labels), np.array(user_preds)
             fpr, tpr, _ = sklearn.metrics.roc_curve(y_true, y_pred)
             precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true, y_pred)
-            auroc = sklearn.metrics.auc(fpr, tpr); auprc = sklearn.metrics.auc(recall, precision)
+            auroc = sklearn.metrics.auc(fpr, tpr)
+            auprc = sklearn.metrics.auc(recall, precision)
             print(f"USER {patient}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}, AVG={(auroc+auprc)/2:.4f}")
-            # accumulate
             all_auroc.append(auroc)
             all_auprc.append(auprc)
         else:
-            if args.mode != "test":
-                print(f"USER {patient}: skipped metrics (labels missing or constant).")
+            print(f"USER {patient}: skipped metrics (labels missing or constant).")
 
     # ---- FINAL AGGREGATE TOTALS (MACRO) ----
-    if args.mode != "test" and all_auroc and all_auprc:
+    if all_auroc and all_auprc:
         total_auroc = float(np.mean(all_auroc))
         total_auprc = float(np.mean(all_auprc))
         total_avg = (total_auroc + total_auprc) / 2.0
@@ -234,3 +215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
