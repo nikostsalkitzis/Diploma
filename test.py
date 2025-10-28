@@ -1,5 +1,4 @@
 from pprint import pprint
-
 import torch
 import argparse
 from model import TransformerClassifier
@@ -48,7 +47,6 @@ def main():
     device = args.device
     print("Using device:", device)
 
-    # same columns used in training
     columns_to_scale = [
         "acc_norm",
         "gyr_norm",
@@ -60,30 +58,30 @@ def main():
         "steps",
     ]
 
-    # load models + ensemble mlps + scalers + train anomaly distributions
+    # Load models, ensemble MLPs, scalers, and training distributions
     encoders, mlps, scalers, train_dists = [], [], [], []
     for i in range(args.num_patients):
         model = TransformerClassifier(vars(args)).to(device)
         pth = os.path.join(args.load_path, str(i + 1))
 
-        # encoder
+        # Encoder
         state = torch.load(os.path.join(pth, "best_encoder.pth"), map_location="cpu")
         model.load_state_dict(state)
         model.eval()
         encoders.append(model)
 
-        # ensemble head
+        # Ensemble MLP head
         ensemble = create_ensemble_mlp(args)
         state = torch.load(os.path.join(pth, "best_ensembles.pth"), map_location="cpu")
         ensemble.load_state_dict(state)
         ensemble.eval()
         mlps.append(ensemble)
 
-        # scaler
+        # Scaler
         with open(os.path.join(pth, "scaler.pkl"), "rb") as f:
             scalers.append(pickle.load(f))
 
-        # train anomaly distribution (dict -> select scores for patient i)
+        # Training anomaly distribution
         with open(os.path.join(pth, "train_dist_anomaly_scores.pkl"), "rb") as f:
             train_dist_dict = pickle.load(f)
             train_dists.append(train_dist_dict[i])
@@ -107,7 +105,6 @@ def main():
             if (args.mode == "val" and "val" in subfolder and subfolder.endswith("val")) or (
                 args.mode == "test" and "test" in subfolder
             ):
-
                 file_path = os.path.join(patient_dir, subfolder, "features_stretched_w_steps.csv")
                 df = pd.read_csv(file_path).replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -131,28 +128,29 @@ def main():
                     else:
                         sequences = []
                         if len(day_data) == args.window_size:
-                            seq = day_data.iloc[0 : args.window_size][columns_to_scale].to_numpy()
+                            seq = day_data.iloc[:args.window_size][columns_to_scale].to_numpy()
                             sequences.append(scalers[patient_id].transform(seq))
                         else:
                             for start in range(0, len(day_data) - args.window_size, args.window_size // 3):
-                                seq = day_data.iloc[start : start + args.window_size][columns_to_scale].to_numpy()
+                                seq = day_data.iloc[start:start + args.window_size][columns_to_scale].to_numpy()
                                 sequences.append(scalers[patient_id].transform(seq))
+
                         sequence = np.stack(sequences)
                         seq_tensor = torch.tensor(sequence, dtype=torch.float32).permute(0, 2, 1).to(device)
 
-                        # forward encoder (take only features)
+                        # Forward encoder (extract features)
                         outputs = encoders[patient_id](seq_tensor)
-                        features = outputs[0]  # first output = features
+                        features = outputs[0]
 
-                        # forward ensemble
+                        # Forward ensemble
                         k = args.ensembles
                         batched_features = features[None, :, :].repeat([k, 1, 1])
                         preds = mlps[patient_id](batched_features)
-                        average_pred = torch.mean(preds, 0)
-
-                        var_score = torch.sum((preds - average_pred) ** 2, dim=(2,))
+                        avg_pred = torch.mean(preds, 0)
+                        var_score = torch.sum((preds - avg_pred) ** 2, dim=(2,))
                         mean_var = torch.mean(torch.mean(var_score, 0)).item()
 
+                        # Normalize and compute anomaly score
                         _mean = np.mean(train_dists[patient_id])
                         _max, _min = np.max(train_dists[patient_id]), np.min(train_dists[patient_id])
                         anomaly_score = (mean_var - _mean) / (_max - _min)
@@ -160,33 +158,44 @@ def main():
 
                     relapse_df.loc[relapse_df[DAY_INDEX] == day_index, "score"] = anomaly_score
                     user_preds.append(anomaly_score)
+
                     if args.mode != "test":
                         relapse_label = relapse_df[relapse_df[DAY_INDEX] == day_index]["relapse"].to_numpy()[0]
                         user_labels.append(relapse_label)
+                    else:
+                        # For test, also read label to compute metrics
+                        relapse_label = relapse_df[relapse_df[DAY_INDEX] == day_index]["relapse"].to_numpy()[0]
+                        user_labels.append(relapse_label)
 
-                if args.mode == "test":
-                    save_dir = os.path.join(args.submission_path, f"patient{patient[1]}", subfolder)
-                    os.makedirs(save_dir, exist_ok=True)
-                    relapse_df.to_csv(os.path.join(save_dir, "submission.csv"), index=False)
-                    print(f"Saved submission to: {save_dir}")
+                save_dir = os.path.join(args.submission_path, f"patient{patient[1]}", subfolder)
+                os.makedirs(save_dir, exist_ok=True)
+                relapse_df.to_csv(os.path.join(save_dir, "submission.csv"), index=False)
+                print(f"Saved submission to: {save_dir}")
 
-        if args.mode != "test" and len(np.unique(user_labels)) > 1:
+        # Compute metrics for both val and test
+        if len(np.unique(user_labels)) > 1:
             y_true, y_pred = np.array(user_labels), np.array(user_preds)
             fpr, tpr, _ = sklearn.metrics.roc_curve(y_true, y_pred)
             precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true, y_pred)
             auroc = sklearn.metrics.auc(fpr, tpr)
             auprc = sklearn.metrics.auc(recall, precision)
-            all_auroc.append(auroc)
-            all_auprc.append(auprc)
-            print(f"USER {patient}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}, AVG={(auroc+auprc)/2:.4f}")
+        else:
+            auroc, auprc = float("nan"), float("nan")
 
-    if args.mode != "test" and all_auroc:
-        total_auroc = sum(all_auroc) / len(all_auroc)
-        total_auprc = sum(all_auprc) / len(all_auprc)
-        print(
-            f"TOTAL AUROC={total_auroc:.4f}, TOTAL AUPRC={total_auprc:.4f}, "
-            f"AVG={(total_auroc+total_auprc)/2:.4f}"
-        )
+        all_auroc.append(auroc)
+        all_auprc.append(auprc)
+        print(f"USER {patient}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}, AVG={(auroc + auprc) / 2:.4f}")
+
+    # Print totals for both val and test
+    if all_auroc:
+        total_auroc = np.nanmean(all_auroc)
+        total_auprc = np.nanmean(all_auprc)
+        total_avg = (total_auroc + total_auprc) / 2
+        print("\n==== FINAL RESULTS ====")
+        print(f"MODE: {args.mode.upper()}")
+        print(f"TOTAL AUROC={total_auroc:.4f}")
+        print(f"TOTAL AUPRC={total_auprc:.4f}")
+        print(f"TOTAL AVG={(total_avg):.4f}")
 
 
 if __name__ == "__main__":
