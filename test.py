@@ -190,7 +190,9 @@ def main():
 
                     relapse_df.loc[relapse_df[DAY_INDEX] == day_index, "score"] = anomaly_score
                     user_preds.append(anomaly_score)
-                    if args.mode != "test":
+
+                    # collect labels if available
+                    if "relapse" in relapse_df.columns:
                         relapse_label = relapse_df[relapse_df[DAY_INDEX] == day_index]["relapse"].to_numpy()[0]
                         user_labels.append(relapse_label)
 
@@ -201,8 +203,8 @@ def main():
                     relapse_df.to_csv(os.path.join(save_dir, "submission.csv"), index=False)
                     print(f"Saved submission to: {save_dir}")
 
-        # --- Evaluation for validation mode ---
-        if args.mode != "test" and len(np.unique(user_labels)) > 1:
+        # --- Evaluation: now prints metrics in both test and val ---
+        if len(np.unique(user_labels)) > 1:
             y_true, y_pred = np.array(user_labels), np.array(user_preds)
             fpr, tpr, _ = sklearn.metrics.roc_curve(y_true, y_pred)
             precision, recall, _ = sklearn.metrics.precision_recall_curve(y_true, y_pred)
@@ -210,15 +212,16 @@ def main():
             auprc = sklearn.metrics.auc(recall, precision)
             all_auroc.append(auroc)
             all_auprc.append(auprc)
-            print(f"USER {patient}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}, AVG={(auroc+auprc)/2:.4f}")
+            print(f"USER {patient}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}, AVG={(auroc + auprc) / 2:.4f}")
+        else:
+            print(f"USER {patient}: skipped metrics (labels missing or constant).")
 
-    if args.mode != "test" and all_auroc:
-        total_auroc = sum(all_auroc) / len(all_auroc)
-        total_auprc = sum(all_auprc) / len(all_auprc)
-        print(
-            f"TOTAL AUROC={total_auroc:.4f}, TOTAL AUPRC={total_auprc:.4f}, "
-            f"AVG={(total_auroc+total_auprc)/2:.4f}"
-        )
+    # --- Final Aggregate Metrics (printed in both test & val) ---
+    if all_auroc and all_auprc:
+        total_auroc = np.mean(all_auroc)
+        total_auprc = np.mean(all_auprc)
+        total_avg = (total_auroc + total_auprc) / 2.0
+        print(f"TOTAL AUROC={total_auroc:.4f}, TOTAL AUPRC={total_auprc:.4f}, AVG={total_avg:.4f}")
 
 
 if __name__ == "__main__":
